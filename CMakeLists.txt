@@ -23,30 +23,51 @@ find_package(Rockchip)
 
 find_package(PkgConfig REQUIRED)
 
-option(ENABLE_SDL "Compile SDL support" ON)
-option(ENABLE_FFMPEG "Compile FFMPEG support" ON)
-option(ENABLE_X11 "Compile X11 support (requires ENABLE_FFMPEG)" ON)
-option(ENABLE_CEC "Compile CEC support" ON)
-option(ENABLE_PULSE "Compile PulseAudio support" ON)
+option(ENABLE_SDL   "Compile SDL support"                     ON)
+option(ENABLE_FFMPEG "Compile FFMPEG support"                 ON)
+option(ENABLE_X11   "Compile X11 support (requires ENABLE_FFMPEG)" ON)
+option(ENABLE_CEC   "Compile CEC support"                     ON)
+option(ENABLE_PULSE "Compile PulseAudio support"              ON)
+
+# FIX #2 : option explicite pour le backend Pi 5
+option(ENABLE_V4L2_DRM "Compile V4L2 M2M + DRM/KMS support (Pi 5)" ON)
+option(ENABLE_MMLA "Compile MMLA support" OFF)
 
 pkg_check_modules(EVDEV REQUIRED libevdev)
-pkg_check_modules(UDEV REQUIRED libudev)
+pkg_check_modules(UDEV  REQUIRED libudev)
+
 if (ENABLE_SDL)
   pkg_check_modules(SDL sdl2>=2.0.4)
 endif()
+
 if (ENABLE_FFMPEG)
   pkg_check_modules(AVCODEC libavcodec)
-  pkg_check_modules(AVUTIL libavutil)
-  pkg_check_modules(VDPAU vdpau)
-  pkg_check_modules(LIBVA libva)
-  pkg_check_modules(EGL egl)
-  pkg_check_modules(GLES glesv2)
+  pkg_check_modules(AVUTIL  libavutil)
+  pkg_check_modules(VDPAU   vdpau)
+  pkg_check_modules(LIBVA   libva)
+  pkg_check_modules(EGL     egl)
+  pkg_check_modules(GLES    glesv2)
 
   if (ENABLE_X11)
-    pkg_check_modules(XLIB x11)
+    pkg_check_modules(XLIB      x11)
     pkg_check_modules(LIBVA_X11 libva-x11)
   endif()
+
+  # FIX #3+4 : libswscale nécessaire pour la conversion de format dans
+  # v4l2drm.c (YUV→XRGB8888) et potentiellement utile pour d'autres backends.
+  pkg_check_modules(SWSCALE libswscale)
+
+  # FIX #2 : libdrm pour le rendu DRM/KMS du backend Pi 5
+  if (ENABLE_V4L2_DRM)
+    pkg_check_modules(LIBDRM libdrm)
+  # Fix D : GBM + EGL pour le zero-copy DRM_PRIME sur Pi 5
+  # EGL est fourni par Mesa (libEGL) — on ajoute le check explicitement
+  pkg_check_modules(GBM   gbm)
+  pkg_check_modules(GLES2 glesv2)
+  pkg_check_modules(EGL2  egl)   # distinct de EGL (X11) pour éviter les conflits
+  endif()
 endif()
+
 if (ENABLE_PULSE)
   pkg_check_modules(PULSE libpulse-simple)
 endif()
@@ -54,14 +75,20 @@ if (ENABLE_CEC)
   pkg_check_modules(CEC libcec>=4)
 endif()
 
-pkg_check_modules(MMAL mmal)
-if (NOT MMAL_FOUND)
-  find_package(MMAL)
+if (ENABLE_MMAL)
+  pkg_check_modules(MMAL mmal)
+  if (NOT MMAL_FOUND)
+    find_package(MMAL)
+  endif()
 endif()
 
+# -------------------------------------------------------------------------
+# Flags de feature
+# -------------------------------------------------------------------------
 set(VDPAU_ACCEL_FOUND FALSE)
-set(VA_ACCEL_FOUND FALSE)
-set(SOFTWARE_FOUND FALSE)
+set(VA_ACCEL_FOUND    FALSE)
+set(SOFTWARE_FOUND    FALSE)
+set(V4L2_DRM_FOUND    FALSE)  # FIX #2
 
 if(AVCODEC_FOUND AND AVUTIL_FOUND)
   if(EGL_FOUND AND GLES_FOUND AND XLIB_FOUND)
@@ -76,10 +103,24 @@ if(AVCODEC_FOUND AND AVUTIL_FOUND)
   if(SDL_FOUND OR X11_FOUND)
     set(SOFTWARE_FOUND TRUE)
   endif()
+
+  # FIX #2 : V4L2_DRM ne nécessite pas X11 — juste libdrm + libswscale
+  if (ENABLE_V4L2_DRM AND LIBDRM_FOUND AND AVCODEC_FOUND)
+    # Fix D : EGL zero-copy (optionnel, fallback swscale si absent)
+    # EGL est toujours présent quand GBM+GLES2 le sont (même package Mesa)
+    if (GBM_FOUND AND GLES2_FOUND AND (EGL_FOUND OR EGL2_FOUND))
+      set(V4L2_DRM_EGL TRUE)
+      message(STATUS "V4L2_DRM: EGL zero-copy path enabled")
+    else()
+      message(STATUS "V4L2_DRM: EGL unavailable, swscale fallback only "
+              "(GBM=${GBM_FOUND} GLES2=${GLES2_FOUND} EGL=${EGL_FOUND} EGL2=${EGL2_FOUND})")
+    endif()
+    set(V4L2_DRM_FOUND TRUE)
+  endif()
 endif()
 
 SET(MOONLIGHT_COMMON_INCLUDE_DIR ./third_party/moonlight-common-c/src)
-SET(GAMESTREAM_INCLUDE_DIR ./libgamestream)
+SET(GAMESTREAM_INCLUDE_DIR       ./libgamestream)
 
 include_directories("${PROJECT_BINARY_DIR}")
 
@@ -94,16 +135,24 @@ if (CMAKE_SYSTEM_NAME MATCHES "FreeBSD")
   target_sources(moonlight PRIVATE ./src/audio/oss.c)
 endif()
 
-check_c_source_compiles("#include <sys/auxv.h>
-                         int main(void) { return getauxval(AT_HWCAP); }" HAVE_GETAUXVAL)
+check_c_source_compiles("
+  #include <sys/auxv.h>
+  int main(void) { return getauxval(AT_HWCAP); }"
+  HAVE_GETAUXVAL)
 if (HAVE_GETAUXVAL)
   list(APPEND MOONLIGHT_DEFINITIONS HAVE_GETAUXVAL)
 endif()
 
-check_c_source_compiles("int main(void) { return __builtin_cpu_supports(\"aes\"); }" HAVE_BICS_AES)
+check_c_source_compiles(
+  "int main(void) { return __builtin_cpu_supports(\"aes\"); }"
+  HAVE_BICS_AES)
 if (HAVE_BICS_AES)
   list(APPEND MOONLIGHT_DEFINITIONS HAVE_BICS_AES)
 endif()
+
+# -------------------------------------------------------------------------
+# Backends hardware (bibliothèques partagées chargées à l'exécution)
+# -------------------------------------------------------------------------
 
 if (CEC_FOUND)
   list(APPEND MOONLIGHT_DEFINITIONS HAVE_LIBCEC)
@@ -162,6 +211,9 @@ if(ROCKCHIP_FOUND)
   install(TARGETS moonlight-rk DESTINATION ${CMAKE_INSTALL_LIBDIR})
 endif()
 
+# -------------------------------------------------------------------------
+# Backend logiciel + accélération X11 (VAAPI / VDPAU)
+# -------------------------------------------------------------------------
 if (SOFTWARE_FOUND)
   target_sources(moonlight PRIVATE ./src/video/ffmpeg.c)
   target_include_directories(moonlight PRIVATE ${AVCODEC_INCLUDE_DIRS} ${AVUTIL_INCLUDE_DIRS})
@@ -195,6 +247,55 @@ if (SOFTWARE_FOUND)
   endif()
 endif()
 
+# -------------------------------------------------------------------------
+# FIX #2 : Backend V4L2 M2M + DRM/KMS (Raspberry Pi 5 et SoC Linux modernes)
+#
+# Compilé directement dans le binaire moonlight (comme X11/SDL), pas en
+# bibliothèque partagée, car il réutilise ffmpeg.c et util.c déjà présents.
+# Si SOFTWARE_FOUND est faux (pas de X11/SDL), on ajoute ffmpeg.c ici.
+# -------------------------------------------------------------------------
+if (V4L2_DRM_FOUND)
+  list(APPEND MOONLIGHT_DEFINITIONS HAVE_V4L2_DRM)
+  list(APPEND MOONLIGHT_OPTIONS     V4L2_DRM)
+
+  target_sources(moonlight PRIVATE ./src/video/v4l2drm.c)
+  target_include_directories(moonlight PRIVATE
+    ${LIBDRM_INCLUDE_DIRS}
+    ${SWSCALE_INCLUDE_DIRS}
+    ${AVCODEC_INCLUDE_DIRS}
+    ${AVUTIL_INCLUDE_DIRS})
+  target_link_libraries(moonlight
+    ${LIBDRM_LIBRARIES}
+    ${SWSCALE_LIBRARIES}
+    ${AVCODEC_LIBRARIES}
+    ${AVUTIL_LIBRARIES})
+
+  if (V4L2_DRM_EGL)
+    list(APPEND MOONLIGHT_DEFINITIONS HAVE_EGL)
+    target_include_directories(moonlight PRIVATE
+      ${GBM_INCLUDE_DIRS} ${GLES2_INCLUDE_DIRS} ${EGL_INCLUDE_DIRS})
+    target_link_libraries(moonlight
+      ${GBM_LIBRARIES} ${GLES2_LIBRARIES} ${EGL_LIBRARIES} ${EGL2_LIBRARIES})
+  endif()
+
+  # Si le backend X11/SDL n'a pas encore ajouté FFmpeg, on le fait ici
+  if (NOT SOFTWARE_FOUND)
+    target_sources(moonlight PRIVATE ./src/video/ffmpeg.c)
+    target_link_libraries(moonlight ${AVCODEC_LIBRARIES} ${AVUTIL_LIBRARIES})
+  endif()
+
+  message(STATUS "V4L2_DRM backend enabled (Pi 5 / V4L2 M2M + DRM/KMS)")
+else()
+  if (ENABLE_V4L2_DRM)
+    message(STATUS "V4L2_DRM backend disabled "
+            "(missing: libdrm=${LIBDRM_FOUND} libswscale=${SWSCALE_FOUND} "
+            "libavcodec=${AVCODEC_FOUND})")
+  endif()
+endif()
+
+# -------------------------------------------------------------------------
+# Audio
+# -------------------------------------------------------------------------
 if (ALSA_FOUND)
   list(APPEND MOONLIGHT_DEFINITIONS HAVE_ALSA)
   list(APPEND MOONLIGHT_OPTIONS ALSA)
@@ -211,23 +312,34 @@ if (PULSE_FOUND)
   target_link_libraries(moonlight ${PULSE_LIBRARIES})
 endif()
 
-if (AMLOGIC_FOUND OR BROADCOM-OMX_FOUND OR MMAL_FOUND OR FREESCALE_FOUND OR ROCKCHIP_FOUND OR X11_FOUND)
+if (AMLOGIC_FOUND OR BROADCOM-OMX_FOUND OR MMAL_FOUND OR FREESCALE_FOUND OR ROCKCHIP_FOUND OR X11_FOUND OR V4L2_DRM_FOUND)
   list(APPEND MOONLIGHT_DEFINITIONS HAVE_EMBEDDED)
   list(APPEND MOONLIGHT_OPTIONS EMBEDDED)
 endif()
 
-if(NOT AMLOGIC_FOUND AND NOT BROADCOM-OMX_FOUND AND NOT MMAL_FOUND AND NOT FREESCALE_FOUND AND NOT ROCKCHIP_FOUND AND NOT SOFTWARE_FOUND)
+if(NOT AMLOGIC_FOUND AND NOT BROADCOM-OMX_FOUND AND NOT MMAL_FOUND AND NOT FREESCALE_FOUND AND NOT ROCKCHIP_FOUND AND NOT SOFTWARE_FOUND AND NOT V4L2_DRM_FOUND)
   message(FATAL_ERROR "No video output available")
 endif()
 
 configure_file("./src/configuration.h.in" "${PROJECT_BINARY_DIR}/configuration.h")
 
 set_property(TARGET moonlight PROPERTY COMPILE_DEFINITIONS ${MOONLIGHT_DEFINITIONS})
-target_include_directories(moonlight PRIVATE ${GAMESTREAM_INCLUDE_DIR} ${MOONLIGHT_COMMON_INCLUDE_DIR} ${OPUS_INCLUDE_DIRS} ${EVDEV_INCLUDE_DIRS} ${UDEV_INCLUDE_DIRS})
-target_link_libraries(moonlight ${EVDEV_LIBRARIES} ${OPUS_LIBRARY} ${UDEV_LIBRARIES} ${CMAKE_DL_LIBS})
+target_include_directories(moonlight PRIVATE
+  ${GAMESTREAM_INCLUDE_DIR}
+  ${MOONLIGHT_COMMON_INCLUDE_DIR}
+  ${OPUS_INCLUDE_DIRS}
+  ${EVDEV_INCLUDE_DIRS}
+  ${UDEV_INCLUDE_DIRS})
+target_link_libraries(moonlight
+  ${EVDEV_LIBRARIES}
+  ${OPUS_LIBRARY}
+  ${UDEV_LIBRARIES}
+  ${CMAKE_DL_LIBS})
 
 add_subdirectory(docs)
 
+
 install(TARGETS moonlight DESTINATION ${CMAKE_INSTALL_BINDIR})
-install(FILES ./third_party/SDL_GameControllerDB/gamecontrollerdb.txt DESTINATION ${CMAKE_INSTALL_DATADIR}/moonlight)
+install(FILES ./third_party/SDL_GameControllerDB/gamecontrollerdb.txt
+        DESTINATION ${CMAKE_INSTALL_DATADIR}/moonlight)
 install(FILES moonlight.conf DESTINATION ${CMAKE_INSTALL_SYSCONFDIR})

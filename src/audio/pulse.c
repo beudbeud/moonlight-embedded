@@ -33,6 +33,17 @@ static short* pcmBuffer;
 static int samplesPerFrame;
 static int channelCount;
 
+/* Normalise un nom de device : les noms ALSA ("default", "hw:x,y", "plughw:...")
+ * ne sont pas des noms de sink PulseAudio valides → on passe NULL à PA pour
+ * qu'il utilise son sink par défaut. */
+static const char* pa_device_name(const char* device) {
+  if (!device) return NULL;
+  if (strcmp(device, "default") == 0) return NULL;
+  if (strncmp(device, "hw:", 3) == 0) return NULL;
+  if (strncmp(device, "plughw:", 7) == 0) return NULL;
+  return device;
+}
+
 bool audio_pulse_init(char* audio_device) {
   pa_sample_spec spec = {
     .format = PA_SAMPLE_S16LE,
@@ -41,12 +52,13 @@ bool audio_pulse_init(char* audio_device) {
   };
 
   int error;
-  dev = pa_simple_new(NULL, "Moonlight Embedded", PA_STREAM_PLAYBACK, audio_device, "Streaming", &spec, NULL, NULL, &error);
+  dev = pa_simple_new(NULL, "Moonlight Embedded", PA_STREAM_PLAYBACK,
+                      pa_device_name(audio_device), "Streaming",
+                      &spec, NULL, NULL, &error);
 
-  if (dev)
-    pa_simple_free(dev);
-
-  return (bool) dev;
+  bool available = (dev != NULL);
+  if (dev) { pa_simple_free(dev); dev = NULL; }
+  return available;
 }
 
 static int pulse_renderer_init(int audioConfiguration, POPUS_MULTISTREAM_CONFIGURATION opusConfig, void* context, int arFlags) {
@@ -72,6 +84,7 @@ static int pulse_renderer_init(int audioConfiguration, POPUS_MULTISTREAM_CONFIGU
   }
 
   decoder = opus_multistream_decoder_create(opusConfig->sampleRate, opusConfig->channelCount, opusConfig->streams, opusConfig->coupledStreams, alsaMapping, &rc);
+  if (!decoder) { printf("Pulseaudio: opus_multistream_decoder_create failed: %d\n", rc); return -1; }
 
   pa_sample_spec spec = {
     .format = PA_SAMPLE_S16LE,
@@ -82,7 +95,7 @@ static int pulse_renderer_init(int audioConfiguration, POPUS_MULTISTREAM_CONFIGU
   pa_channel_map map;
   pa_channel_map_init_auto(&map, opusConfig->channelCount, PA_CHANNEL_MAP_ALSA);
 
-  char* audio_device = (char*) context;
+  const char* audio_device = pa_device_name((char*) context);
   dev = pa_simple_new(NULL, "Moonlight Embedded", PA_STREAM_PLAYBACK, audio_device, "Streaming", &spec, &map, NULL, &error);
 
   if (!dev) {
